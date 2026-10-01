@@ -164,68 +164,73 @@ function RouteLine({ path, color = "#2563eb", weight = 5 }) {
 
   useEffect(() => {
     let cancelled = false;
-    let polylines = [];
+    let polyline = null;
 
     async function calculateRoadRoute() {
-      if (!map || !window.google || !path || path.length < 2) {
+      if (!map || !window.google?.maps || !path || path.length < 2) {
         return;
       }
 
+      const origin = path[0];
+      const destination = path[path.length - 1];
+
+      // OSRM uses the OpenStreetMap road network and does not require
+      // a Google Routes API request or billing account.
+      const url = `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=full&geometries=geojson&steps=false`;
+
       try {
-        // Load Google's modern Routes library.
-        const { Route } =
-          await window.google.maps.importLibrary("routes");
-
-        if (cancelled) {
-          return;
-        }
-
-        const origin = path[0];
-        const destination = path[path.length - 1];
-
-        // Points between origin and destination are forced as
-        // intermediate waypoints, while Google chooses the
-        // actual drivable road geometry between them.
-        const intermediates = path.slice(1, -1);
-
-        const request = {
+        console.log(
+          "REQUESTING FREE ROAD ROUTE:",
           origin,
-          destination,
-          intermediates,
-          travelMode: "DRIVING",
-          fields: ["path"],
-          polylineQuality: "HIGH_QUALITY",
-          computeAlternativeRoutes: false,
-        };
+          "→",
+          destination
+        );
 
-        const result = await Route.computeRoutes(request);
+        const response = await fetch(url);
 
-        if (cancelled) {
+        if (!response.ok) {
+          throw new Error(`OSRM HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (cancelled) return;
+
+        if (data.code !== "Ok" || !data.routes?.length) {
+          console.error("OSRM RETURNED NO ROUTE:", data);
           return;
         }
 
-        if (!result?.routes?.length) {
-          console.warn("Google Routes: No drivable route found.");
+        const coordinates = data.routes[0].geometry?.coordinates || [];
+
+        if (coordinates.length < 2) {
+          console.error("OSRM RETURNED NO ROAD GEOMETRY:", data);
           return;
         }
 
-        const route = result.routes[0];
+        // Convert GeoJSON [lng, lat] into Google Maps {lat, lng} points.
+        const roadPath = coordinates.map(([lng, lat]) => ({ lat, lng }));
 
-        polylines = route.createPolylines();
+        polyline = new window.google.maps.Polyline({
+          path: roadPath,
+          geodesic: false,
+          strokeColor: color,
+          strokeOpacity: 0.95,
+          strokeWeight: weight,
+          clickable: false,
+          zIndex: 30,
+          map,
+        });
 
-        polylines.forEach((polyline) => {
-          polyline.setOptions({
-            strokeColor: color,
-            strokeOpacity: 0.9,
-            strokeWeight: weight,
-            clickable: false,
-            zIndex: 20,
-          });
-
-          polyline.setMap(map);
+        console.log("FREE ROAD ROUTE DISPLAYED SUCCESSFULLY", {
+          points: roadPath.length,
+          distanceMeters: Math.round(data.routes[0].distance || 0),
+          durationSeconds: Math.round(data.routes[0].duration || 0),
         });
       } catch (error) {
-        console.error("Google Routes API error:", error);
+        if (!cancelled) {
+          console.error("ROAD ROUTING ERROR:", error);
+        }
       }
     }
 
@@ -234,11 +239,10 @@ function RouteLine({ path, color = "#2563eb", weight = 5 }) {
     return () => {
       cancelled = true;
 
-      polylines.forEach((polyline) => {
+      if (polyline) {
         polyline.setMap(null);
-      });
-
-      polylines = [];
+        polyline = null;
+      }
     };
   }, [map, path, color, weight]);
 
@@ -951,23 +955,45 @@ function App() {
       return paths;
     }
 
-    // Normal mode: show the selected vehicle's assigned route.
+    // Normal mode:
+    // Calculate the ORIGINAL GOOGLE DRIVING ROUTE:
+    // selected vehicle -> its actual customer.
+    //
+    // No T1, H1, or manually connected route points.
     if (selectedVehicle) {
-      const routeName = selectedVehicle.location;
+      const vehicleLocation =
+        LOCATIONS[selectedVehicle.id];
 
-      if (ROUTES[routeName]) {
-        const points = ROUTES[routeName]
-          .map((name) => LOCATIONS[name])
-          .filter(Boolean);
+      const assignedOrder = orders.find(
+        (order) =>
+          order.assigned_vehicle === selectedVehicle.id &&
+          order.status !== "CANCELLED"
+      );
 
-        if (points.length >= 2) {
-          paths.push(points);
-        }
+      const defaultDestinationByVehicle = {
+        V1: "Customer 1",
+        V2: "Customer 2",
+        V3: "Customer 1",
+        V4: "Customer 1",
+      };
+
+      const destinationName =
+        assignedOrder?.destination ||
+        defaultDestinationByVehicle[selectedVehicle.id];
+
+      const destinationLocation =
+        LOCATIONS[destinationName];
+
+      if (vehicleLocation && destinationLocation) {
+        paths.push([
+          vehicleLocation,
+          destinationLocation,
+        ]);
       }
     }
 
     return paths;
-  }, [selectedVehicle, optimizationResult]);
+  }, [selectedVehicle, orders, optimizationResult]);
 
   /* =======================================================
      GOOGLE KEY CHECK
